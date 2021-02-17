@@ -1,0 +1,913 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use diagnostics;
+use Getopt::Long;
+use List::Util qw(first max maxstr min minstr reduce shuffle sum);
+use Term::ANSIColor qw(:constants);
+use Statistics::Descriptive;
+use File::Basename;
+use Parallel::ForkManager;
+use Sort::Key::Natural qw(natsort);
+our $dirname = dirname (__FILE__);
+use lib (dirname (__FILE__));
+use lib::IO;
+#use lib::peakCluster;
+#use lib::Plot;
+use lib::Utils;
+
+
+########### Checking external programs availability
+
+our $deepbind = (-x "$dirname/deepbind/deepbind")
+ ? "$dirname/deepbind/deepbind"
+ : "DeepBind not found";
+
+our $bedtools = `which bedtools`;
+chomp $bedtools;
+
+our $samtools =  `which samtools`;
+chomp $samtools;
+
+our $create236bin       = "$dirname/bin/create236.pl";
+our $create236binMotifs = "$dirname/bin/create_236bp_motifs.pl";
+our $getUniqSampName    = "$dirname/bin/getUniqSampName.pl";
+
+# System commands
+our $cat  = 
+  ( -x "/bin/cat" )
+  ? "/bin/cat"
+  : `which cat`;
+chomp $cat;  
+  
+our $wc = 
+  ( -x "/bin/wc" )
+  ? "/bin/wc"
+  : `which wc`;
+chomp $wc;  
+  
+our $sed = 
+  ( -x "/bin/sed" )
+  ? "/bin/sed"
+  : `which sed`;
+chomp $sed;  
+  
+our  $awk  = 
+  ( -x "/usr/bin/awk" )
+  ? "/usr/bin/awk"
+  : `which awk`;
+chomp $awk;  
+  
+our  $split  = 
+  ( -x "/usr/bin/split" )
+  ? "/usr/bin/split"
+  : `which split`;
+chomp $split;  
+  
+our  $grep  = 
+  ( -x "/bin/grep" )
+  ? "/bin/grep"
+  : `which grep`;
+chomp $grep;  
+  
+our  $sort  = 
+  ( -x "/usr/bin/gsort" )
+  ? "/usr/bin/gsort"
+  : `which gsort`;
+chomp $sort;  
+
+###########
+
+ my $config;
+
+ printHelp() if ( @ARGV < 1 or !GetOptions(
+	'i=s'=> \$config,
+	)
+ );
+
+ # Gathering global parameters
+ our %Params = IO::getParams($config);
+
+ # Defining file names
+ our $tmp_collapse     = "$Params{outdir}/tmp.collapsed.bed";
+ our $merged_peaks     = "$Params{outdir}/merged.peaks.bed";
+ our $haplo_2scan      = "$Params{outdir}/haplos_2scan_motifs.bed"; 
+ our $tmpBED           = "$Params{outdir}/tmp.bed"; 
+ our $tmpFASTA         = "$Params{outdir}/tmp.fa"; 
+ our $subseqs_wt       = "$Params{outdir}/subseqs.wt"; 
+ our $subseqs_mut      = "$Params{outdir}/subseqs.mut"; 
+ our $motif_list       = "$Params{outdir}/motif_list.bed"; 
+ our $motif_list_236   = "$Params{outdir}/motif_list_236bp.bed"; 
+ our $FASTA_collection = "$Params{outdir}/FASTA_WT_and_MUT_sequences.txt";
+ our $motifNotFound    = "$Params{outdir}/Peaks_without_motif.txt";
+
+ # Gathering sample names and paired file information
+ our ($samples, $assoc) = IO::getSamples($config);
+
+ # Printing params to stderr
+ print STDERR "\n ### PARAMETERS ###\n";
+ foreach my $param ( sort keys %Params ) {
+ 	print STDERR " # $param: $Params{$param}\n";
+ }
+ 
+ print STDERR "\n ### SAMPLE FILES ###\n";
+ our %samples = %$samples;
+ our %assoc = %$assoc;
+ my $ncount = 0;
+ my @samples;
+ foreach my $associated ( sort keys %assoc ) {
+	$ncount++;
+	if ($Params{mode} eq 'full') {
+		print STDERR "$ncount. ChIP-seq: $associated\tVCF: $assoc{$associated}\n";
+ 		push @samples, $assoc{$associated};
+	}
+	else {
+		print STDERR "$ncount. ChIP-seq: $associated\n";
+ 		push @samples, $associated;
+	}
+ }
+  
+ ## MAIN
+ 
+ mergeChipSeqData();
+ createHaplotypesFromChipSeq();
+ regionScanning();
+ 
+ ## END
+
+
+#######################
+ 
+sub convertVcf2Bed {
+
+   my %assoc = @_;
+   my @outfiles = ();
+   foreach my $vcf (sort keys %assoc ) {
+	open (IN, "<", $assoc{$vcf}) || die "Unable to open $assoc{$vcf}\n";
+	my $convertedBED = basename ($assoc{$vcf});
+	$convertedBED =~s/.vcf/.vcfconverted2bed.bed/;
+	open (OUT, ">", "$Params{outdir}/$convertedBED") || die "Unable to open $Params{outdir}/$convertedBED\n";
+	push @outfiles, "$Params{outdir}/$convertedBED";
+	while (my $line=<IN>) {
+		next if $line =~/^#/;
+		my @tmp = split (/\t/, $line);
+		next if $tmp[5] < 20;
+		my @info = split (/:/, $tmp[9]);
+		my $gt = "GT=$info[0]";
+		my $end = $tmp[1]+1;
+		print OUT "$tmp[0]\t$tmp[1]\t$end\t$assoc{$vcf}\t$tmp[3]>$tmp[4];$gt\n";
+		
+	}
+        close IN;
+	close OUT;
+   }
+   return (@outfiles);
+}
+
+#######################
+
+sub createHaplotypesFromChipSeq {
+
+  my @variant_files = convertVcf2Bed(%assoc);
+ 
+  my $int = `$bedtools intersect -a $merged_peaks -b @variant_files -wao -filenames`;
+  chomp $int;
+
+  my %entries = ();
+  my @tmpInt = split (/\n/, $int);	
+  my %seen = ();
+
+  # First we will put repeats into the same hash for faster processing than grep
+  foreach my $entry (@tmpInt) {
+  
+       my @tmp = split (/\t/, $entry);
+       if ($tmp[5] ne -1) {
+       	$entries{"$tmp[0]\t$tmp[1]\t$tmp[2]"} .= "$entry&";
+       }
+       else {
+       	$entries{"$tmp[0]\t$tmp[1]\t$tmp[2]"} = "$entry";
+       }
+   }
+    
+  open (HAPLOTYPES, ">", $haplo_2scan) || die "Unable to open $haplo_2scan\n";
+  foreach my $hit ( natsort keys %entries ) {
+	my @multiple = split ("&", $entries{$hit});
+	my %samples = ();
+	my %haplotypes = ();
+	if (scalar (@multiple) > 1) {
+		foreach my $x (@multiple) {
+			my @tmp = split (/\t/, $x);
+			my $var = "$tmp[4]:$tmp[5]-$tmp[6];$tmp[8]";
+			$samples{$tmp[7]} .= "$var&";
+		}
+		foreach my $sample ( sort keys %samples ) {
+			$haplotypes{$samples{$sample}} .= "$sample,";
+		}
+		foreach my $haplo ( sort keys %haplotypes ) {
+			$haplotypes{$haplo} = substr ($haplotypes{$haplo}, 0 , length ( $haplotypes{$haplo} ) -1 ); 
+			my $haplot =  substr ($haplo, 0 , length ($haplo) -1 ); 
+			print HAPLOTYPES "$hit\t$haplot\t$haplotypes{$haplo}\n";
+		}
+  	}
+	else {
+		print HAPLOTYPES "$hit\tNONE\tSAME_AS_REFERENCE\n";
+	}
+  }
+  close HAPLOTYPES;
+}
+
+#######################
+
+sub regionScanning {
+
+ #my $cmd = "$cat $haplo_2scan | $awk '{ print \$1\"\t\"\$2\"\t\"\$3\"\t\"\$4\";samples=\"\$5 }' | $bedtools merge -i stdin -c 4 -o collapse -delim \"|\"  > $Params{outdir}/haplotypes_collapsed.bed";
+ #system ("$cmd");
+ 
+my $cmd = "$cat $haplo_2scan | $awk '{ print \$1\"\t\"\$2\"\t\"\$3\"\t\"\$4\";samples=\"\$5 }'  > $Params{outdir}/haplotypes_collapsed.bed";
+ system ("$cmd");
+ 
+ open (FASTA, ">>", $FASTA_collection) || die "Unable to open $FASTA_collection\n";
+
+ Utils::splitFile("$Params{outdir}/haplotypes_collapsed.bed");
+ my @chunks = glob ("$Params{outdir}/xa*");
+ my $pm = Parallel::ForkManager->new($Params{threads});
+ my $counter = 0;
+ my ($max_wt, $max_mut);
+ foreach my $chunk (@chunks) {
+	$counter++;
+    my $pid = $pm -> start() and next; 
+    open (IN, "<", $chunk) || die "Unable to open $chunk\n";
+	open (OUT, ">", "$Params{outdir}/motifs.$counter.txt");
+	open (NOMOTIF, ">", "$Params{outdir}/nomotifs.$counter.txt");
+ 
+     while (my $line =<IN>) {
+
+	chomp $line;
+	my ($chrBED, $startBED, $endBED, $info) = split (/\t/, $line);
+	
+	# Size of the peak
+	my $size = $endBED - $startBED;
+
+	# Wild-type and mutated sequcnes
+	my ($wt, $mut);
+
+	# Wild-type and mutated sequences maximum DeepBind scores
+
+	# Wild-type and mutated sequences mean DeepBind scores
+	my ($mean_wt, $mean_mut);
+
+	# This variable contains the previous variants in case of consecutive variants in a sequence
+	my $prevmut;
+	my ($prev_vartype, $prev_varlength);
+
+	# Number of variants
+	my $count = 0;
+	my $start;
+	my $posVariant;
+
+	my ($ref, $alt);
+ 	my $vars_in_peak = "NONE";
+	my $check_wt;
+
+	my @haplotypes = split (/\|/, $info);
+	my %regions_hash = ();
+	my $wt_tag = 0;
+	
+	my $chrstartend = "$chrBED\t$startBED\t$endBED";
+
+	# If no variants
+	if ($wt_tag == 0  || $info =~/NONE/ ) {
+		my $toadd = 0;
+		my $i = 0;
+
+		# WT sequence extraction
+		my $outEnd = $endBED+36;
+		$wt = `$samtools faidx $Params{genome} $chrBED:$startBED-$outEnd | grep -v '>'`;
+		$wt =~s/\n+//g;
+		$wt =~s/,//g;
+
+		# Creating overlapping 36-mers
+		my @wt_fasta = Utils::createOverlappingSubseqs($wt);
+
+		$subseqs_wt = "$Params{outdir}/$chrBED\_$startBED\_$endBED.$counter.fa";
+		open (WT, ">$subseqs_wt") || die "Unable to open $subseqs_wt\n";
+		foreach my $wseq (@wt_fasta) {
+			print WT ">seq_$i\n$wseq\n";
+			$i++;
+		}
+		close WT;
+		
+		# DeepBind wild-type score
+		my ($Clusters_wt, $max_tmp, $mean_tmp) = deepBindScore($subseqs_wt, $counter);
+
+		$max_wt = $max_tmp;
+		$mean_wt = $mean_tmp;
+	    $max_mut = $max_wt if !$max_mut;
+		$wt_tag = 1;
+
+ 		my %Clusters_wt = %$Clusters_wt;
+		my $n_peaks = 0;
+ 		my @peaks_to_plot = ();
+		my $outname = "$chrBED\_$startBED\_$endBED";
+		
+		if ( $Params{find_motifs} eq 'yes' &&  scalar keys %Clusters_wt == 0 ) {
+			print NOMOTIF "$chrstartend\t$max_wt\t$mean_wt\t$max_wt\t$mean_wt\t0\n";
+		}
+		if ( $Params{find_motifs} eq 'no' && $info =~/NONE/) {
+				print OUT "$chrstartend\t$chrstartend\tNONE\t$max_wt\t$mean_wt\t$max_wt\t$mean_wt\t0\n";
+		}
+		elsif ( $Params{find_motifs} eq 'yes' ) {
+			foreach my $c (sort keys %Clusters_wt) {
+		    	$n_peaks ++;
+		    	push @peaks_to_plot, $Clusters_wt{$c}{START};
+		    	push @peaks_to_plot, $Clusters_wt{$c}{END};
+		    	my $peak_start = $Clusters_wt{$c}{START}+$startBED;
+		    	my $peak_end   = $Clusters_wt{$c}{END}+$startBED;
+		    	my $max        = $Clusters_wt{$c}{MAX};
+		    	my $outname    = "$chrBED\_$startBED\_$endBED";
+		    	$mean_wt       = $Clusters_wt{$c}{MEAN};
+		    	if ($info =~/NONE/) {
+		    		#print OUT "$chrstartend\t$chrBED\t$peak_start\t$peak_end\tNONE\t$max\t$mean_wt\t$max\t$mean_wt\t0\n";
+		    	}					
+		    	print OUT "$chrstartend\t$chrBED\t$peak_start\t$peak_end\tNONE\t$max\t$mean_wt\t$max\t$mean_wt\t0\n";
+		    }		
+		}
+		if ($Params{plot} eq 'yes' ) {
+		    plotScoreDist("$Params{outdir}/toplot.$counter.scores.txt", $size, $outname, \@peaks_to_plot);
+		}
+	}
+
+	if ($info !~/NONE/)  {
+
+		foreach my $haplo ( @haplotypes ) {
+				$vars_in_peak = "";
+				my @samples_found = split (/samples=/, $haplo);
+				my $haplo_geno = $samples_found[0];
+				my @spread = split (/,/, $samples_found[1]);
+				my @variants = split (/&/, $haplo);
+				foreach my $variant (@variants) {
+
+					$count++;
+					my ($var_chr, $var_start, $ref, $alt, $gt) = ( split /[:\-;>]/, $variant)[0,2,3,4,5];
+
+				   	($mut, $posVariant, $prev_vartype, $prev_varlength) = createMutatedSeq($var_chr, $var_start, $ref, $alt, $chrBED, $startBED, $endBED, $count, $wt, $prev_vartype, $prev_varlength);
+			   		$vars_in_peak.= "$var_chr:$var_start\[$ref>$alt\]:$gt:$posVariant,";
+				   	if (scalar (@variants) > 1) {
+				     		$wt = $mut;
+					}
+				}
+
+				# deleting last comma
+				$vars_in_peak =~s/\$,//;
+				$mut =~s/,//g;
+				my $i = 0;
+				$mut = $wt if !$mut;
+				my @mut_fasta = Utils::createOverlappingSubseqs($mut);
+				$subseqs_mut = "$Params{outdir}/$chrBED\_$startBED\_$endBED.$counter.fa";
+				open (MUT, ">$subseqs_mut") || die "Unable to open $subseqs_mut\n";
+				foreach my $mseq (@mut_fasta) {
+					print MUT ">seq_$i\n$mseq\n";
+					$i++;
+				}
+				close MUT;
+		 		my ($Clusters_mut, $max_tmp, $mean_tmp) = deepBindScore($subseqs_mut, $counter);
+		 		my %Clusters_mut = %$Clusters_mut;
+		 		$max_mut = $max_tmp;
+		 		$mean_mut = $mean_tmp;
+		 		
+				if ( $Params{find_motifs} eq 'yes' &&  scalar keys %Clusters_mut == 0 ) {
+					print NOMOTIF "$chrstartend\t$max_mut\t$mean_mut\t$max_mut\t$mean_mut\t0\n";
+				}		 		
+				my $n_peaks = 0;
+		 		my @peaks_to_plot = ();
+				my $outname = "$chrBED\_$startBED\_$endBED";
+				
+				if ( $Params{find_motifs} eq 'no' ) {
+					foreach my $y (@spread) {
+					    $haplo_geno =~s/\$;//;
+
+				   		$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$startBED\t$endBED"}{VARIANTS} = $haplo_geno;
+						$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$startBED\t$endBED"}{MAX}      = $max_mut;
+ 						$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$startBED\t$endBED"}{MEAN_MUT} = $mean_mut;
+ 						$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$startBED\t$endBED"}{MEAN_WT}  = $mean_wt;
+					}
+				}
+				elsif ($Params{find_motifs} eq 'yes') {
+					foreach my $c (sort keys %Clusters_mut) {
+					    $n_peaks ++;
+				 	   push @peaks_to_plot, $Clusters_mut{$c}{START};
+				    	push @peaks_to_plot, $Clusters_mut{$c}{END};
+				    	my $peak_start = $Clusters_mut{$c}{START}+$startBED;
+				    	my $peak_end = $Clusters_mut{$c}{END}+$startBED;
+				    	my $max = $Clusters_mut{$c}{MAX};
+				    	my 	$outname = "$chrBED\_$startBED\_$endBED";
+
+				    	foreach my $y (@spread) {
+					    	$haplo_geno =~s/\$;//;
+					    	print FASTA ">$chrBED\_$startBED\_$endBED.$haplo_geno.$max_tmp\n$mut\n";
+					    	$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$peak_start\t$peak_end"}{VARIANTS} = $haplo_geno;
+					    	$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$peak_start\t$peak_end"}{MAX}      = $max_tmp;
+ 					    	$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$peak_start\t$peak_end"}{MEAN_MUT} = $Clusters_mut{$c}{MEAN};
+ 					    	$regions_hash{"$chrBED\t$startBED\t$endBED"}{$y}{"$chrBED\t$peak_start\t$peak_end"}{MEAN_WT}  = $mean_wt;
+				    	}
+					}
+				}
+				if ($Params{plot} eq 'yes' ) {
+			    		plotScoreDist("$Params{outdir}/toplot.$counter.scores.txt", $size, $outname, \@peaks_to_plot);
+				}
+		}
+	}
+
+	foreach my $r ( keys %regions_hash ) {
+			print OUT "$r";
+			foreach my $sample (@samples) {
+				my $flag = 0;
+				my $key = "";
+				foreach my $s ( keys %{$regions_hash{$r}}) {
+					if ($s =~/$sample/) {
+						$flag = 1;
+						$key = $s;
+						last;
+					}
+				}
+				if ($flag == 1 ) {
+
+					foreach my $n_motif ( keys %{$regions_hash{$r}{$key}}) {
+
+						if ($regions_hash{$r}{$key}{$n_motif}{VARIANTS} =~ /GT=1\/1/) {
+							my $ABS_D = abs($regions_hash{$r}{$key}{$n_motif}{MAX} - $max_wt);
+							print OUT "\t$n_motif\t$regions_hash{$r}{$key}{$n_motif}{VARIANTS}\t$max_wt\t$regions_hash{$r}{$key}{$n_motif}{MEAN_MUT}\t$regions_hash{$r}{$key}{$n_motif}{MAX}\t$regions_hash{$r}{$key}{$n_motif}{MEAN_MUT}\t$ABS_D";
+
+						}
+						elsif ($regions_hash{$r}{$key}{$n_motif}{VARIANTS} =~ /GT=0\/1/) {
+							my $ABS_D = abs($regions_hash{$r}{$key}{$n_motif}{MAX} - $max_wt);
+							if (!$mean_wt) { $mean_wt = $regions_hash{$r}{$key}{$n_motif}{MEAN_MUT}; }
+							print OUT "\t$n_motif\t$regions_hash{$r}{$key}{$n_motif}{VARIANTS}\t$max_wt\t$mean_wt\t$regions_hash{$r}{$key}{$n_motif}{MAX}\t$regions_hash{$r}{$key}{$n_motif}{MEAN_MUT}\t$ABS_D";
+						}
+					}
+				}
+				else {
+					print OUT "\tNONE\t$max_wt\t$max_wt\t0";
+				}
+			 }
+		print OUT "\n";
+	}
+  }
+  $pm->finish;
+}
+ close IN;
+ close OUT;
+ close NOMOTIF;
+ $pm->wait_all_children;
+ 
+ unlink (glob "$Params{outdir}/*.fa");
+ `cat $Params{outdir}/motifs* > $Params{outdir}/$Params{outdir}_DeepBind_analysis.bed`;
+ `cat $Params{outdir}/nomotifs* > $motifNotFound`;
+
+ #`$sed -i \'1i\
+ #chr_peak\tstart_peak\tend_peak\tchr_motif\tstart_motif\tend_motif\tmax_wt\tmean_wt\tmax_mut\tmean-mut\tAbsoluteDifference_between_maxwt_and_maxmut\'
+ #$Params{outdir}/$Params{outdir}_DeepBind_analysis.bed`;
+# Add header line
+open (IN, "<", "$Params{outdir}/$Params{outdir}_DeepBind_analysis.bed");
+open (TMP, ">", "$Params{outdir}/tmp_header.txt");
+my $nline = 0;
+while (my $line =<IN>) {
+	chomp $line;
+	if ($nline == 0) {
+		print TMP "chr_peak\tstart_peak\tend_peak\tchr_motif\tstart_motif\tend_motif\tmax_wt\tmean_wt\tmax_mut\tmean-mut\tAbsoluteDifference_between_maxwt_and_maxmut\n";
+		print TMP "$line\n";
+	}
+	else {
+		print TMP "$line\n";
+	}
+	$nline++;
+}
+close IN;
+close TMP;
+
+unlink("$Params{outdir}/$Params{outdir}_DeepBind_analysis.bed");
+rename("$Params{outdir}/tmp_header.txt", "$Params{outdir}/$Params{outdir}_DeepBind_analysis.bed");
+
+ unlink (glob "$Params{outdir}/*vcfconverted*");
+ unlink (glob "$Params{outdir}/toplot*");
+ unlink (glob "$Params{outdir}/nomotifs*");
+ unlink (glob "$Params{outdir}/motifs*");
+ unlink (glob "$Params{outdir}/x*");
+}
+
+#######################
+sub mergeChipSeqData {
+
+ my @samples = ();
+ foreach my $file ( sort keys %assoc ) {
+	push @samples, $file;
+ }
+
+ # Performing a multi-intersection of ChIP-seq peaks
+ my $mult_intersect;
+ if (@samples > 1) {
+	 $mult_intersect =  `$bedtools multiinter -i @samples`;
+	 chomp $mult_intersect;
+ }
+ else {
+	$mult_intersect = `cat $samples[0]`;
+	chomp $mult_intersect;
+
+ }
+ # Collapsing intersection info
+ open (TMP, ">", $tmp_collapse) || die "Unable to open $tmp_collapse\n";
+ my @tmpInt = split (/\n/, $mult_intersect);
+ foreach my $line ( @tmpInt ) {
+	next if $line =~/CHR/;
+	my $samp_str;
+        my @tmp = split (/\t/, $line);
+	#$tmp[0] =~s/chr//;
+	my $j = 0;
+	for (my $i=5;$i<=@tmp-1;$i++) {
+		$samp_str .= $samples[$j] . "," if $tmp[$i] == 1;
+		$j++;
+	}
+	if ( @samples == 1 ) {
+		print TMP join("\t", @tmp[0..2]) . "\t" . $samples[0] ."\n";
+	}
+	else {
+		print TMP join("\t", @tmp[0..2]) . "\t" . substr ($samp_str, 0, length ($samp_str)-1) ."\n";
+	}
+ }
+ close TMP;
+
+ # Merging peaks, create 236 bp windows, merge windows into a colapsed file
+ 
+ my $cmd = "$bedtools merge -i $tmp_collapse -c 4 -o collapse | $create236bin $Params{size} | $bedtools merge -i stdin -c 4 -o collapse | $getUniqSampName > $merged_peaks";
+ system ("$cmd");
+ 
+#$merged_peaks = $tmp_collapse;
+ 
+ # Deleting temporal file
+ #unlink ($tmp_collapse);
+}
+
+###################
+
+sub createBED {
+
+ my ($chr, $start, $end) = @_;
+ open (BED, ">", "$Params{outdir}/tmp.bed") || die "ERROR: Unable to open $Params{outdir}/tmp.bed\n";
+ print BED "$chr\t$start\t$end\n";
+ close BED;
+ 
+}
+
+####################
+sub checkEvenOdd {
+
+ my $size = shift;
+ if ($size % 2 == 1)
+ {
+    return 0;
+ }
+ else
+ {
+    return 1;
+ }
+}
+
+#####################
+
+sub deepBindScore {
+
+ my $infile = shift;
+ my $counter = shift;
+ my $tmpscore = `$deepbind $dirname/deepbind/regseq.ids < $infile 2> /dev/null`;
+  
+ my @arrscore = split (/\n/, $tmpscore);
+ my $i = 18;
+ my @medarr = ();
+ open (TOPLOT, ">", "$Params{outdir}/toplot.$counter.scores.txt") || die "ERROR: Unable to open $Params{outdir}/toplot.$counter.scores.txt\n";
+ print TOPLOT "Pos\tScore\n";
+ foreach my $x(@arrscore) {
+ 
+	next if $x =~/^D/;
+	push @medarr, $x;
+	$i++;
+	print TOPLOT "$i\t$x\n";
+ }
+ close TOPLOT;
+ 
+ my $HoC;
+ my %HoC = ();
+ my $max = max (@medarr);
+ my $mean_score = Utils::meanArray(@medarr);
+ if ($Params{find_motifs} eq 'yes') {
+ 
+ 	$HoC = Clustering({scores  => \@medarr,});
+ 	%HoC = %$HoC;
+ }
+ else {
+ 	my $ncluster = 1;
+ 	$HoC{$ncluster}{START} = 0;
+ 	$HoC{$ncluster}{END} =  0;
+ 	$HoC{$ncluster}{MAX} = $max;
+ 	$HoC{$ncluster}{MEAN} = $mean_score;
+ }
+ 
+ return (\%HoC, $max, $mean_score);
+}
+
+#####################
+
+sub Clustering {
+
+ my ($argsSub) = @_;
+ my $scores  = $argsSub->{scores};
+ my $file = $argsSub->{file};
+
+ my %CLUSTER;
+ my $tag = 0;    
+ my $init;
+ my $j = 0;
+ my @vars = ();
+ my @newscores = @$scores;
+ my $ncluster = 0;
+ my @tomean = ();
+ 
+ my $min = min @newscores;
+ my $maxscore = max @newscores;
+
+ my $start;
+ my $end;
+
+ my $length = scalar @newscores;
+ foreach my $x (@newscores) {
+	$j++;
+	if ($tag == 0) {
+	   $start = $j;
+	   $init = $x;
+	   $tag  = 1;
+	   @vars = ();
+	   next;
+	}
+	if ($tag == 1) {
+		my $leaf = $x;
+		my $variation = Utils::calculateVariation($min, $leaf);
+	        $variation=~s/\%//;
+			$variation=~s/\+//;
+       		if ( abs($variation) >= 30) {
+		    push @tomean, $leaf;
+		    push @vars, "$j\t$variation\t$leaf";
+		}
+		if (abs($variation) < 30 || $variation == 0) {
+			$end = $j;
+			my $max_at_peak = max (@tomean);
+			if (@vars > 10 && $max_at_peak > 0){
+				$ncluster++;
+				$CLUSTER{$ncluster}{START} = $start + 18;
+				$CLUSTER{$ncluster}{END}   = $end + 18;
+				$CLUSTER{$ncluster}{MAX}   = $max_at_peak;
+				$CLUSTER{$ncluster}{MEAN}  = Utils::meanArray(@tomean);
+				my $max = max (@tomean);
+			}
+		$tag = 0; 
+		@vars = ();
+		@tomean = ();
+		}
+	}
+ }
+  return (\%CLUSTER);
+}
+
+#######################
+
+sub createMutatedSeq {
+
+ my ($chr, $start, $ref, $alt, $chrBED, $startBED, $endBED, $count, $wt, $prev_vartype, $prev_varlength) = @_;
+
+ my $addToEdge = 0;
+ my $mut;
+ my $Lref = length($ref); # Reference length
+ my $Lalt = length($alt); # Alternative length
+ my $toadd = 0;
+
+ #my $posVariant = $start-$startBED-1;   bedtools mode
+ my $posVariant = $start-$startBED;    # Samtools mode
+ my $lprev;
+ my $var_type;
+
+ if ($prev_vartype) {
+   if ( $prev_vartype eq 'deletion') {
+	$posVariant = $posVariant-$prev_varlength;
+   }
+   if ( $prev_vartype eq 'insertion') {
+	$posVariant = $posVariant+$prev_varlength;
+   }    
+ }
+ # for deletions
+ if ($Lref > $Lalt) {
+     ($wt, $mut, $lprev) = introduceDeletion($ref, $alt, $chrBED, $startBED, $endBED, $posVariant, $count, $wt);
+     $var_type = 'deletion';
+ }
+ # For SNPs and delins
+ # La posició de l'SNP serà 49 en coordenades 0-based ó 50 en coordenades 1-based
+ if ($Lref == $Lalt) {
+     ($wt, $mut, $lprev)  = introduceSNP($ref, $alt, $chrBED, $startBED, $endBED, $posVariant, $count, $wt);
+     $var_type = 'SNP';
+ }
+ # Insertions
+ if ($Lalt > $Lref) {
+     ($wt, $mut, $lprev) = introduceInsertion($ref, $alt, $chrBED, $startBED, $endBED, $posVariant, $count, $wt);
+     $var_type = 'insertion';
+ }
+
+ return ($mut, $posVariant, $var_type, $lprev);
+}
+
+######################
+
+sub introduceSNP {
+ my ($ref, $alt, $chrBED, $startBED, $endBED, $posVariant, $count, $wt) = @_; 	
+ my $toadd = 0;
+ if ($count == 1 || !$wt) {
+    my $outEnd = $endBED+36;
+    $wt = `$samtools faidx $Params{genome} $chrBED:$startBED-$endBED | grep -v ">"`;
+    $wt =~s/\n+//g;
+    #$wt = Utils::bedToFasta($chrBED, $startBED, $endBED, $toadd); 
+ }
+
+ my @tmp  = split ("", $wt);
+ my $ltmp = scalar(@tmp);
+ my $Lref = length ($ref);
+ my $Lalt = length ($alt);
+ my $mut;
+
+ if ($posVariant > $ltmp) {
+	print "WARNING: Returning wild-type sequence. Variant at $chrBED:$startBED-$endBED\t$ref/$alt is outside of sequence offset\n";
+	return ($wt, $wt, $toadd);
+ }
+
+ if ($Lref == '1' && $Lalt == '1') { # for single SNPs
+ 	if ($posVariant > 0) {
+	    $tmp[$posVariant-1] = $alt;
+	}
+	elsif ($posVariant == 0) {
+	    $tmp[0] = $alt;
+	}
+	$mut  = join ("", @tmp);
+ }
+ else { # for Delins  (e.g ref:GT alt:TC )
+ 	my @alt = split ("", $alt);
+	for (my $i = 0; $i < @alt; $i++) 
+	{
+	    $tmp[$posVariant-1+$i] = $alt[$i];
+	}
+	$mut = join ("", @tmp);
+ }
+ return ($wt, $mut, $toadd);
+}
+
+######################
+
+sub introduceDeletion {
+
+ my ($ref, $alt, $chrBED, $startBED, $endBED, $posVariant, $count, $wt) = @_; 
+ my @ref = split ("", $ref);
+ my @alt = split ("", $alt);
+ my @tmpref = @ref;
+ my $deletion;
+ # Here we compare the ref with alt, and we obtain the deleted bases
+ for (my $i=0; $i<@alt; $i++) {
+ 	if ($ref[$i] eq $alt[$i]){
+ 		shift @tmpref;
+		$deletion = join ("", @tmpref);
+	}
+	else {
+		shift @tmpref;
+		$deletion = join ("", @tmpref);
+	}	
+ }
+ my $toadd = length($deletion);
+ if ($count == 1 || !$wt) {
+    my $outEnd = $endBED+36;
+    $wt = `$samtools faidx $Params{genome} $chrBED:$startBED-$outEnd | grep -v '>'`;
+    $wt =~s/\n+//g;
+    #$wt = Utils::bedToFasta($chrBED, $startBED, $endBED, $toadd); 
+ }
+ 
+ # Return if variant position is beyond the sequence length
+ my $limit = $posVariant + $toadd;
+ if ($posVariant > length ($wt) || $limit > length ($wt) ) {
+	return ($wt, $wt, $toadd);
+ }
+
+ # Construction is:  FIRST /*DELETED/ SECOND, where * is omitted
+ my $first  = substr($wt, 0, $posVariant);
+ my $second = substr($wt, $posVariant + $toadd);
+ my $mut = $first.$second;
+ my $toffset = length($wt)-length($deletion);
+ $wt  = substr($wt, 0, $toffset);
+ return ($wt, $mut, $toadd);
+}
+
+######################
+
+sub introduceInsertion {
+ my ($ref, $alt, $chrBED, $startBED, $endBED, $posVariant, $count, $wt) = @_; 
+ my $insertion = $alt;
+ my @alt = split ("", $alt);
+ my @ref = split ("", $ref);
+ my @tmpAlt = @alt;
+ my $toadd = 0;
+
+ if ($count == 1 || !$wt) {
+    my $outEnd = $endBED+36;
+    $wt = `$samtools faidx $Params{genome} $chrBED:$startBED-$outEnd | grep -v '>'`;
+    $wt =~s/\n+//g;
+    #$wt = Utils::bedToFasta($chrBED, $startBED, $endBED, $toadd); 
+ }
+ if ($posVariant > length ($wt)) {
+	return ($wt, $wt, $toadd);
+ }
+ # Here we compare the ref with alt, and we obtain the inserted bases
+ for (my $i=0; $i<@ref; $i++) {
+	if ($insertion eq $ref){
+		$insertion = join ("", @tmpAlt);
+	 	last;
+	}
+	if ($alt[$i] eq $ref[$i]) {
+		shift @tmpAlt;
+		#print "@tmpAlt\n";
+		$insertion = join ("", @tmpAlt);
+	}
+	else {
+		shift @tmpAlt;
+		$insertion = join ("", @tmpAlt);
+	}
+ }
+ # Construction is:  FIRST /*INSERTED/ SECOND, where * is included
+ my $length = length($insertion);
+ my $first  = substr($wt, 0, $posVariant);
+ my $second = substr($wt, $posVariant);
+ my $mut  = $first.$insertion.$second;		
+ $mut  = substr ($mut, 0, length($mut)-length($insertion));
+ return ($wt, $mut, $length); 
+}
+
+################################3
+sub plotScoreDist {
+ 
+  my ($toplot, $nbases, $outname, $peaks_tp) = @_;
+
+  my @peaks_tp = @$peaks_tp;
+  my $str = "";
+  my $i = 0;
+  foreach my $p (@peaks_tp) {
+	$i++;
+	if ($i == 1) {
+		$str.= " geom_vline(size = 0.1, xintercept = $p ,colour=\"red\", linetype = \"longdash\") +";
+	}
+	if ($i == 2) {
+		$str.= " geom_vline(size = 0.1, xintercept = $p ,colour=\"blue\", linetype = \"longdash\") +";
+		$i = 0;
+	}
+  }
+  if (@peaks_tp) {
+
+  open (R, ">plot.peaks.r") || die "Unable to open plot.peaks.r\n";
+  print R "library(ggplot2)\n";
+  print R "mydata <- read.table(file = \"$toplot\", sep = \"\t\", header = TRUE)\n";
+  print R "xseq <- seq(1,$nbases)\n";
+  print R "myplot <- ggplot (mydata, aes(x=Pos, y=Score)) + geom_line(aes(y = Score, colour = \"Score\"),alpha=.9)  + $str ggtitle(\"$outname\") + theme_bw() + xlab (\"Position\") + ylab (\"DeepBind's Score\")\n";
+  print R "newplot<-myplot + theme(panel.border = element_rect(colour = \"black\", fill=NA)) + scale_color_manual(values=c(\"#990000\"))\n";
+  print R "ggsave(newplot, file=\"$Params{outdir}/$outname.png\", width=4, height=4)\n";
+  close R;
+  my $rscript=`which Rscript`; chomp $rscript;
+  `$rscript plot.peaks.r`;
+  unlink ("plot.peaks.r");
+ }
+ else {	
+  open (R, ">plot.peaks.r") || die "Unable to open plot.peaks.r\n";
+  print R "library(ggplot2)\n";
+  print R "mydata <- read.table(file = \"$toplot\", sep = \"\t\", header = TRUE)\n";
+  print R "xseq <- seq(1,$nbases)\n";
+  print R "myplot <- ggplot (mydata, aes(x=Pos, y=Score)) + geom_line(aes(y = Score, colour = \"Score\"),alpha=.9)  + ggtitle(\"$outname\") + theme_bw() + xlab (\"Position\") + ylab (\"DeepBind's Score\")\n";
+  print R "newplot<-myplot + theme(panel.border = element_rect(colour = \"black\", fill=NA)) + scale_color_manual(values=c(\"#990000\"))\n";
+  print R "ggsave(newplot, file=\"$Params{outdir}/$outname.png\", width=4, height=4)\n";
+  close R;
+  my $rscript=`which Rscript`; chomp $rscript;
+  `$rscript plot.peaks.r`;
+  unlink ("plot.peaks.r");
+ }
+}
+
+
+#######################
+sub printHelp {
+
+print STDERR "Usage: ./DeepBindTK -i <CONFIG> 
+     Params:
+     -i		STRING	Configuration file.  [REQUIRED] 
+     -verbose	STRING	[OPTIONAL]
+     -debug	STRING	[OPTIONAL]\n\n";
+exit;
+}
+

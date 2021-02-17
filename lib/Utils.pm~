@@ -1,0 +1,149 @@
+package Utils;
+
+use strict;
+use warnings;
+use List::MoreUtils qw(uniq);
+use Term::ANSIColor qw(:constants);
+use File::Basename;
+use Cwd qw(cwd abs_path);
+
+
+sub splitFile {
+
+ my $infile = shift;
+ my $Nlines = `$::cat $infile | wc -l`;
+ chomp $Nlines;
+ my $nchunks = int ($Nlines/$::Params{threads}); 
+ my $cmd = "$::split -l $nchunks $infile $::Params{outdir}/x";
+ system ($cmd);
+}
+
+sub createOverlappingSubseqs {
+ my $seq = shift;
+ my @tmp = split (//, $seq);
+ my @array = ();
+ #for (my $i = 0; $i <= @tmp-$::params{subseq_length}-1; $i++) {
+ for (my $i = 0; $i < @tmp-35-2; $i++) {
+   my $subseq = substr ($seq, $i, 36);
+   push @array, $subseq;
+ }
+ return @array;
+}
+
+#// deprecated
+sub checkEvenLength {
+
+ my $number = shift;
+ my $is_even = $number % 2 == 0;
+ my $is_odd  = $number % 2 == 1;
+ if ($is_even) {
+	return 1;
+ }
+ else {
+	return 0;
+ }
+}
+
+
+sub bedToFasta {
+
+ my ($name, $chr, $start, $end, $toadd) = @_;
+ my $ed = $end + $toadd;
+
+ open  OUT , ">", "$::tmpBED.$name" || die "Unable to open $::tmpBED.$name\n";
+ print OUT "$chr\t$start\t$ed\tchr;start\n";
+ close OUT;
+
+ my $cmd = "$::bedtools getfasta -fi $::Params{genome} -bed $::tmpBED.$name -fo $::tmpFASTA.$name ";
+ system ("$cmd");
+
+ my $wt = `grep -v \'>\' $::tmpFASTA.$name`;
+ unlink( "$::tmpBED.$name" , "$::tmpFASTA.$name");
+ chomp $wt;
+ return ($wt);   
+}
+
+sub calculateVariation {
+ my ($wtscore, $mutscore) = @_;
+ my $variation;
+ my $result;
+ if ($wtscore == $mutscore) {
+	$result = "0%";
+	return $result;
+ }
+ if (($wtscore > 0) && ($mutscore > 0)) {
+	if ($mutscore > $wtscore) {
+		my $numerator = $mutscore-$wtscore;
+		$variation = sprintf "%2.2f",  100 * $numerator/$wtscore;
+		$result = "+$variation%";
+		return $result;
+	}
+	if ($wtscore > $mutscore) {
+		my $numerator = $wtscore - $mutscore;
+		$variation = sprintf "%2.2f",  100 * $numerator/$wtscore;
+		$result = "-$variation%";
+		return $result;
+	}
+ }
+ elsif (($wtscore < 0) && ($mutscore < 0)) {
+	if ($mutscore > $wtscore) {
+		my $numerator = abs($wtscore)-abs($mutscore);
+		$variation = sprintf "%2.2f",  100 * $numerator/abs($wtscore);
+		$result = "+$variation%";
+		return $result;
+	}
+	if ($wtscore > $mutscore) {
+		my $numerator = abs($mutscore) - abs($wtscore);
+		$variation = sprintf "%2.2f",  100 * $numerator/abs($wtscore);
+		$result = "-$variation%";
+		return $result;
+	}
+ }
+ elsif (($wtscore < 0) && ($mutscore > 0 )){
+	my $numerator = abs($wtscore) + $mutscore;
+	$variation = sprintf "%2.2f",  100 * $numerator/$mutscore;
+	$result = "+$variation%";
+	return $result;
+ }
+ elsif (($wtscore > 0) && ($mutscore < 0)) {	
+	my $numerator = $wtscore + abs($mutscore);
+	$variation = sprintf "%2.2f",  100 * $numerator/$wtscore;
+	$result = "-$variation%";
+	return $result;
+ }
+}
+
+sub varianceArray {
+ my @data = @_;
+ my $stat = Statistics::Descriptive::Full->new();
+ $stat -> add_data(@data);
+ my $variance = $stat->variance();
+ if (!$variance) {
+	$variance = 0;
+	return $variance;
+ }
+ return $variance;
+}
+
+
+sub meanArray {
+ my @data = @_;
+ my $stat = Statistics::Descriptive::Full->new();
+ $stat -> add_data(@data);
+ my $mean = $stat->mean();
+ if (!$mean) {
+	$mean = 0;
+	return $mean;
+ }
+ return sprintf "%2.6f", $mean;
+}
+
+sub medianArray {
+ my @data = @_;
+ my $stat = Statistics::Descriptive::Full->new();
+ $stat -> add_data(@data);
+ my $median = $stat->median();
+ return sprintf "%2.3f", $median;
+}
+
+return 1;

@@ -1,0 +1,10 @@
+bed1	ctcf_fig1b.bed
+vcf1	invented_vcf.vcf
+mode	full
+size	37
+genome	~/Desktop/ucsc.hg19/ucsc.hg19.fasta
+tfmodel	CTCF
+outdir	Prova
+threads	2
+find_motifs	yes
+plot	no
